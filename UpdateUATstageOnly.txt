@@ -1,0 +1,110 @@
+﻿$organization = "amtesudevops"
+$project = "codetolab"
+$pat = "5XNyyFjN5FhX377vQhu1A8Ax8sKtQ9vK4FzBAmjgGXlrtGoL7VT3JQQJ99BEACAAAAAAAAAAAAASAZDO2RFr"
+
+$base64AuthInfo = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$pat"))
+$authHeader = "Basic $base64AuthInfo"
+
+$teamDisplayName = "codetolab Team"
+
+# === Step 1: Get graph groups and find the right team ===
+$groupsUrl = "https://vssps.dev.azure.com/$organization/_apis/graph/groups?Descriptor=Microsoft.TeamFoundation.Project%3A$project&api-version=6.0-preview.1"
+$groupsResponse = Invoke-RestMethod -Uri $groupsUrl -Headers @{ Authorization = $authHeader }
+
+$targetGroup = $groupsResponse.value | Where-Object { $_.displayName -eq $teamDisplayName }
+
+if (-not $targetGroup) {
+    Write-Error "❌ Group '$teamDisplayName' not found in graph groups."
+    exit
+}
+
+$teamDescriptor = $targetGroup.descriptor
+$groupId = $targetGroup.originId
+
+Write-Host "`n✅ Found group:"
+Write-Host "  DisplayName: $teamDisplayName"
+Write-Host "  Descriptor:  $teamDescriptor"
+Write-Host "  Group ID:    $groupId"
+
+# === Step 2: Get all release definitions ===
+$definitionsUrl = "https://vsrm.dev.azure.com/$organization/$project/_apis/release/definitions?api-version=6.1-preview.4"
+$definitionsResponse = Invoke-RestMethod -Uri $definitionsUrl -Headers @{ Authorization = $authHeader }
+
+foreach ($definition in $definitionsResponse.value) {
+    $definitionId = $definition.id
+    $definitionName = $definition.name
+    $detailsUrl = "https://vsrm.dev.azure.com/$organization/$project/_apis/release/definitions/$($definition.id)?api-version=6.1-preview.4"
+
+    try {
+        $definitionDetails = Invoke-RestMethod -Uri $detailsUrl -Headers @{ Authorization = $authHeader }
+    } catch {
+        Write-Error "❌ Failed to retrieve details for pipeline ID $definitionId. $_"
+        continue
+    }
+
+    $adeStage = $definitionDetails.environments | Where-Object { $_.name -eq "ade" }
+
+    if (-not $adeStage) {
+        Write-Host "⚠️  Stage 'ade' not found in pipeline '$definitionName'. Skipping."
+        continue
+    }
+
+    Write-Host "`nProcessing pipeline '$definitionName' (ID: $definitionId)..."
+
+    # Ensure postDeployApprovals exists
+    if (-not $adeStage.postDeployApprovals) {
+        $adeStage.postDeployApprovals = [PSCustomObject]@{
+            approvals    = @()
+            approvalType = "Manual"
+            isAutomated  = $false
+        }
+    }
+
+    # Create a new post-deployment approval object
+    $newApproval = [PSCustomObject]@{
+        id           = 0
+        rank         = 1
+        approver     = @{
+            id          = $groupId
+            descriptor  = $teamDescriptor
+            displayName = $teamDisplayName
+            uniqueName  = $teamDisplayName
+        }
+        approvalType = "PostDeploy"
+        isAutomated  = $false
+    }
+
+    $adeStage.postDeployApprovals = [PSCustomObject]@{
+        approvals    = @($newApproval)
+        approvalType = "Manual"
+        isAutomated  = $false
+    }
+
+    # Replace updated stage back in definition
+    for ($i = 0; $i -lt $definitionDetails.environments.Count; $i++) {
+        if ($definitionDetails.environments[$i].id -eq $adeStage.id) {
+            $definitionDetails.environments[$i] = $adeStage
+            break
+        }
+    }
+
+    # Convert to JSON
+    try {
+        $jsonBody = $definitionDetails | ConvertTo-Json -Depth 100
+    } catch {
+        Write-Error "❌ Failed to convert updated definition to JSON. $_"
+        continue
+    }
+
+    # PUT update to Azure DevOps
+    try {
+        Invoke-RestMethod -Uri $detailsUrl -Headers @{
+            Authorization = $authHeader
+            "Content-Type" = "application/json"
+        } -Method Put -Body $jsonBody
+
+        Write-Host "✅ Successfully updated post-deployment approval for '$definitionName'."
+    } catch {
+        Write-Error "❌ Failed to update release definition for '$definitionName': $_"
+    }
+}
